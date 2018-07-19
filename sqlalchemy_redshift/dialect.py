@@ -3,7 +3,7 @@ from collections import defaultdict, namedtuple
 
 import pkg_resources
 import sqlalchemy as sa
-from sqlalchemy import Column, exc, inspect
+from sqlalchemy import Column, exc
 from sqlalchemy.dialects.postgresql.base import (
     PGCompiler, PGDDLCompiler, PGIdentifierPreparer
 )
@@ -140,14 +140,10 @@ class RelationKey(namedtuple('RelationKey', ('name', 'schema'))):
     """
     __slots__ = ()
 
-    def __new__(cls, name, schema=None, connection=None):
+    def __new__(cls, name, schema):
         """
         Construct a new RelationKey with an explicit schema name.
         """
-        if schema is None and connection is None:
-            raise ValueError("Must specify either schema or connection")
-        if schema is None:
-            schema = inspect(connection).default_schema_name
         return super(RelationKey, cls).__new__(cls, name, schema)
 
     def __str__(self):
@@ -589,15 +585,14 @@ class RedshiftDialect(PGDialect_psycopg2):
         return cargs, default_args
 
     def _get_table_or_view_names(self, relkind, connection, schema=None, **kw):
-        default_schema = inspect(connection).default_schema_name
         if not schema:
-            schema = default_schema
+            schema = self.default_schema_name
         info_cache = kw.get('info_cache')
-        all_relations = self._get_all_relation_info(connection,
-                                                    info_cache=info_cache)
+        all_relations = self._get_schema_relation_info(
+            connection, schema, info_cache=info_cache)
         relation_names = []
         for key, relation in all_relations.items():
-            if key.schema == schema and relation.relkind == relkind:
+            if relation.relkind == relkind:
                 relation_names.append(key.name)
         return relation_names
 
@@ -624,10 +619,12 @@ class RedshiftDialect(PGDialect_psycopg2):
 
     def _get_redshift_relation(self, connection, table_name,
                                schema=None, **kw):
+        if not schema:
+            schema = self.default_schema_name
         info_cache = kw.get('info_cache')
-        all_relations = self._get_all_relation_info(connection,
-                                                    info_cache=info_cache)
-        key = RelationKey(table_name, schema, connection)
+        all_relations = self._get_schema_relation_info(
+            connection, schema, info_cache=info_cache)
+        key = RelationKey(table_name, schema)
         if key not in all_relations.keys():
             key = key.unquoted()
         try:
@@ -636,10 +633,12 @@ class RedshiftDialect(PGDialect_psycopg2):
             raise sa.exc.NoSuchTableError(key)
 
     def _get_redshift_columns(self, connection, table_name, schema=None, **kw):
+        if not schema:
+            schema = self.default_schema_name
         info_cache = kw.get('info_cache')
-        all_columns = self._get_all_column_info(connection,
-                                                info_cache=info_cache)
-        key = RelationKey(table_name, schema, connection)
+        all_columns = self._get_schema_column_info(connection, schema,
+                                                   info_cache=info_cache)
+        key = RelationKey(table_name, schema)
         if key not in all_columns.keys():
             key = key.unquoted()
         return all_columns[key]
@@ -647,16 +646,16 @@ class RedshiftDialect(PGDialect_psycopg2):
     def _get_redshift_constraints(self, connection, table_name,
                                   schema=None, **kw):
         info_cache = kw.get('info_cache')
-        all_constraints = self._get_all_constraint_info(connection,
-                                                        info_cache=info_cache)
+        all_constraints = self._get_schema_constraint_info(
+            connection, schema, info_cache=info_cache)
         key = RelationKey(table_name, schema, connection)
         if key not in all_constraints.keys():
             key = key.unquoted()
         return all_constraints[key]
 
     @reflection.cache
-    def _get_all_relation_info(self, connection, **kw):
-        result = connection.execute("""
+    def _get_schema_relation_info(self, connection, schema, **kw):
+        result = connection.execute(sa.sql.text("""
         SELECT
           c.relkind,
           n.oid as "schema_oid",
@@ -675,20 +674,20 @@ class RedshiftDialect(PGDialect_psycopg2):
              LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              JOIN pg_catalog.pg_user u ON u.usesysid = c.relowner
         WHERE c.relkind IN ('r', 'v', 'm', 'S', 'f')
-          AND n.nspname !~ '^pg_'
+          AND n.nspname = :schema
         ORDER BY c.relkind, n.oid, n.nspname;
-        """)
+        """), schema=schema)
         relations = {}
         for rel in result:
-            key = RelationKey(rel.relname, rel.schema, connection)
+            key = RelationKey(rel.relname, rel.schema)
             relations[key] = rel
         return relations
 
     @reflection.cache
-    def _get_all_column_info(self, connection, **kw):
+    def _get_schema_column_info(self, connection, schema, **kw):
         all_columns = defaultdict(list)
         with connection.contextual_connect() as cc:
-            result = cc.execute("""
+            result = cc.execute(sa.sql.text("""
             SELECT
               n.nspname as "schema",
               c.relname as "table_name",
@@ -710,20 +709,20 @@ class RedshiftDialect(PGDialect_psycopg2):
               ON att.attrelid = c.oid
             LEFT JOIN pg_catalog.pg_attrdef ad
               ON (att.attrelid, att.attnum) = (ad.adrelid, ad.adnum)
-            WHERE n.nspname !~ '^pg_'
+            WHERE n.nspname = :schema
               AND att.attnum > 0
               AND NOT att.attisdropped
             ORDER BY n.nspname, c.relname, att.attnum
-            """)
+            """), schema=schema)
             for col in result:
-                key = RelationKey(col.table_name, col.schema, connection)
+                key = RelationKey(col.table_name, col.schema)
                 all_columns[key].append(col)
 
         return dict(all_columns)
 
     @reflection.cache
-    def _get_all_constraint_info(self, connection, **kw):
-        result = connection.execute("""
+    def _get_schema_constraint_info(self, connection, schema, **kw):
+        result = connection.execute(sa.sql.text("""
         SELECT
           n.nspname as "schema",
           c.relname as "table_name",
@@ -742,12 +741,12 @@ class RedshiftDialect(PGDialect_psycopg2):
           ON t.conrelid = c.oid
         JOIN pg_catalog.pg_attribute a
           ON t.conrelid = a.attrelid AND a.attnum = ANY(t.conkey)
-        WHERE n.nspname !~ '^pg_'
+        WHERE n.nspname = :schema
         ORDER BY n.nspname, c.relname
-        """)
+        """), schema=schema)
         all_constraints = defaultdict(list)
         for con in result:
-            key = RelationKey(con.table_name, con.schema, connection)
+            key = RelationKey(con.table_name, con.schema)
             all_constraints[key].append(con)
         return all_constraints
 
